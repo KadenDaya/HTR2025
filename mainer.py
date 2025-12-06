@@ -348,6 +348,13 @@ def send_notification(message, notification_type='stair'):
                 notification_in_progress = False
             return
         last_notification_time = current_time
+    elif notification_type == 'proximity_danger':
+        # Proximity danger uses same cooldown as YOLO hazards
+        if current_time - last_yolo_notification_time < yolo_notification_cooldown:
+            with notification_lock:
+                notification_in_progress = False
+            return
+        last_yolo_notification_time = current_time
     else:
         # For YOLO objects, use combined cooldown to prevent overlap
         if current_time - last_yolo_notification_time < yolo_notification_cooldown:
@@ -371,6 +378,22 @@ def send_stair_notification(distance_m=None):
     else:
         message = "stairs ahead"
     send_notification(message, 'stair')
+
+def check_proximity_danger(depth_frame):
+    """Check if any depth reading is < 20cm (about to hit something like a wall)."""
+    # Focus on lower portion of frame where obstacles would be
+    h, w = depth_frame.shape
+    roi_bottom = int(h * 0.7)  # Check bottom 70% of frame
+    depth_roi = depth_frame[roi_bottom:, :]
+    
+    # Check for any valid depth readings < 20cm (200mm)
+    close_obstacles = depth_roi[(depth_roi > 50) & (depth_roi < 200)]
+    
+    # If significant number of pixels are very close, send danger warning
+    if len(close_obstacles) > 100:  # At least 100 pixels indicating close obstacle
+        send_notification("DANGER OBJECT AHEAD", 'proximity_danger')
+        return True
+    return False
 
 def check_yolo_hazards(results, depth_frame, frame_rgb):
     """Check YOLO detections for close hazards and send notifications. Prioritizes closest objects."""
@@ -476,13 +499,6 @@ def check_yolo_hazards(results, depth_frame, frame_rgb):
         # Sort by distance (closest first)
         hazards.sort(key=lambda x: x['distance'])
         
-        # Check for DANGER - objects within 15cm (0.15m)
-        closest_distance = hazards[0]['distance']
-        if closest_distance <= 0.15:
-            # DANGER! Object very close
-            send_notification("DANGER OBJECT AHEAD", 'yolo_hazard')
-            return
-        
         # Group hazards by type (count duplicates)
         hazard_counts = {}
         for hazard in hazards:
@@ -538,12 +554,17 @@ with dai.Device(pipeline) as device:
             continue
         frame_depth = depth_frame.getFrame()
         
+        # Check for proximity danger first (depth < 20cm - about to hit something)
+        danger_detected = check_proximity_danger(frame_depth)
+        
         # Run YOLO object detection (optimized for speed)
         # Use smaller input size for faster inference
         results = model(frame_rgb, verbose=False, conf=0.65, imgsz=640)
         
-        # Check for close hazards (people, chairs, desks) - STRICT distance filtering
-        check_yolo_hazards(results, frame_depth, frame_rgb)
+        # Only check YOLO hazards if no immediate danger was detected
+        if not danger_detected:
+            # Check for close hazards (people, chairs, desks) - STRICT distance filtering
+            check_yolo_hazards(results, frame_depth, frame_rgb)
         
         # Draw YOLO detections on the frame (already filtered by confidence)
         annotated_frame = results[0].plot()
