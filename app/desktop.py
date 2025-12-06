@@ -23,9 +23,6 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"OK")
 
-    def log_message(self, format, *args):
-        return
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
