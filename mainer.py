@@ -476,6 +476,13 @@ def check_yolo_hazards(results, depth_frame, frame_rgb):
         # Sort by distance (closest first)
         hazards.sort(key=lambda x: x['distance'])
         
+        # Check for DANGER - objects within 15cm (0.15m)
+        closest_distance = hazards[0]['distance']
+        if closest_distance <= 0.15:
+            # DANGER! Object very close
+            send_notification("DANGER OBJECT AHEAD", 'yolo_hazard')
+            return
+        
         # Group hazards by type (count duplicates)
         hazard_counts = {}
         for hazard in hazards:
