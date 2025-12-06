@@ -3,3 +3,5 @@ depthai-sdk
 opencv-python>=4.5.0
 numpy
 PySide6
+playsound3
+text-to-speech
