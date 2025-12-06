@@ -53,7 +53,7 @@ class StairDetectionTracker:
         return self.current_state
 
 def detect_stairs(depth_frame, rgb_frame=None, min_step_height_mm=80, max_step_height_mm=350, 
-                  min_steps=2, roi_bottom_percent=0.65):
+                  min_steps=3, roi_bottom_percent=0.65):
     """
     Detect stairs in depth frame using depth discontinuity analysis.
     
@@ -293,7 +293,7 @@ stair_tracker = StairDetectionTracker(history_size=5, detection_threshold=0.3)
 last_notification_time = 0
 notification_cooldown = 2.0  # Seconds between notifications
 
-def send_stair_notification(num_steps, distance=None, confidence=None):
+def send_stair_notification():
     """Send HTTP notification to localhost:8080/?msg= when stairs are detected."""
     global last_notification_time
     current_time = time.time()
@@ -303,14 +303,8 @@ def send_stair_notification(num_steps, distance=None, confidence=None):
         return
     
     try:
-        # Build message
-        msg_parts = [f"Stairs detected: {num_steps} steps"]
-        if distance:
-            msg_parts.append(f"{distance:.2f}m away")
-        if confidence:
-            msg_parts.append(f"confidence: {confidence:.0%}")
-        
-        message = " | ".join(msg_parts)
+        # Simple message
+        message = "stairs ahead"
         
         # URL encode the message
         encoded_msg = urllib.parse.quote(message)
@@ -356,14 +350,7 @@ with dai.Device(pipeline) as device:
         if stair_result['detected']:
             # Send HTTP notification only if confidence is above 75%
             if stair_result['confidence'] >= 0.75:
-                distance_m = None
-                if stair_result['distance_to_first_step']:
-                    distance_m = stair_result['distance_to_first_step'] / 1000.0
-                send_stair_notification(
-                    stair_result['num_steps'], 
-                    distance=distance_m,
-                    confidence=stair_result['confidence']
-                )
+                send_stair_notification()
             
             # Draw bounding box
             if stair_result['bbox']:
