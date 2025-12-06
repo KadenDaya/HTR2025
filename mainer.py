@@ -291,9 +291,9 @@ stair_tracker = StairDetectionTracker(history_size=5, detection_threshold=0.3)
 
 # Track last notification time to throttle HTTP requests
 last_notification_time = 0
-notification_cooldown = 2.0  # Seconds between notifications
+notification_cooldown = 5.0  # Seconds between notifications (increased to prevent spamming while walking up stairs)
 
-def send_stair_notification():
+def send_stair_notification(distance_m=None):
     """Send HTTP notification to localhost:8080/?msg= when stairs are detected."""
     global last_notification_time
     current_time = time.time()
@@ -303,8 +303,11 @@ def send_stair_notification():
         return
     
     try:
-        # Simple message
-        message = "stairs ahead"
+        # Build message with distance to start of stairs
+        if distance_m is not None:
+            message = f"stairs ahead {distance_m:.1f}m"
+        else:
+            message = "stairs ahead"
         
         # URL encode the message
         encoded_msg = urllib.parse.quote(message)
@@ -330,10 +333,10 @@ with dai.Device(pipeline) as device:
         img_frame = q_rgb.get()
         frame_rgb = img_frame.getCvFrame()
         
-        # Run YOLO object detection on RGB frame
-        results = model(frame_rgb, verbose=False)
+        # Run YOLO object detection on RGB frame with confidence threshold >= 55%
+        results = model(frame_rgb, verbose=False, conf=0.55)
         
-        # Draw YOLO detections on the frame
+        # Draw YOLO detections on the frame (already filtered by confidence)
         annotated_frame = results[0].plot()
         
         # Get depth frame
@@ -348,9 +351,12 @@ with dai.Device(pipeline) as device:
         
         # Draw stair detection on RGB frame
         if stair_result['detected']:
-            # Send HTTP notification only if confidence is above 75%
-            if stair_result['confidence'] >= 0.75:
-                send_stair_notification()
+            # Send HTTP notification only if confidence is above 80%
+            if stair_result['confidence'] >= 0.80:
+                distance_m = None
+                if stair_result['distance_to_first_step']:
+                    distance_m = stair_result['distance_to_first_step'] / 1000.0
+                send_stair_notification(distance_m=distance_m)
             
             # Draw bounding box
             if stair_result['bbox']:
