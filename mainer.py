@@ -294,12 +294,16 @@ stair_tracker = StairDetectionTracker(history_size=5, detection_threshold=0.3)
 last_notification_time = 0
 notification_cooldown = 5.0  # Seconds between notifications (increased to prevent spamming while walking up stairs)
 
-# Track last notification time per object type for YOLO hazards
-last_yolo_notification_time = {}
-yolo_notification_cooldown = 3.0  # Seconds between notifications for same object type
+# Track last notification time for YOLO hazards (combined cooldown to prevent TTS overlap)
+last_yolo_notification_time = 0
+yolo_notification_cooldown = 4.0  # Seconds between YOLO notifications (prevents TTS overlap)
+
+# Notification lock to prevent overlapping TTS
+notification_lock = threading.Lock()
+notification_in_progress = False
 
 # Maximum distance for YOLO hazard notifications (in meters) - STRICT threshold
-MAX_HAZARD_DISTANCE_M = 3.0  # Only notify for objects within 3 meters
+MAX_HAZARD_DISTANCE_M = 2.0  # Only notify for objects within 2 meters
 
 # YOLO class names for hazards we care about
 HAZARD_CLASSES = {
@@ -313,30 +317,44 @@ HAZARD_CLASSES = {
 
 def _send_http_request(url, message):
     """Helper function to send HTTP request in background thread."""
+    global notification_in_progress
     try:
         urllib.request.urlopen(url, timeout=0.5)
         print(f"Sent notification: {message}")
     except Exception as e:
         # Silently fail if server is not available
         pass
+    finally:
+        # Release lock after request completes
+        with notification_lock:
+            notification_in_progress = False
 
 def send_notification(message, notification_type='stair'):
-    """Send HTTP notification to localhost:8080/?msg= with throttling. Non-blocking."""
-    global last_notification_time, last_yolo_notification_time
+    """Send HTTP notification to localhost:8080/?msg= with throttling. Prevents TTS overlap."""
+    global last_notification_time, last_yolo_notification_time, notification_in_progress
     
     current_time = time.time()
+    
+    # Check if a notification is already in progress (prevent TTS overlap)
+    with notification_lock:
+        if notification_in_progress:
+            return  # Skip if TTS is already speaking
+        notification_in_progress = True
     
     # Use different cooldown based on notification type
     if notification_type == 'stair':
         if current_time - last_notification_time < notification_cooldown:
+            with notification_lock:
+                notification_in_progress = False
             return
         last_notification_time = current_time
     else:
-        # For YOLO objects, track per object type
-        if notification_type in last_yolo_notification_time:
-            if current_time - last_yolo_notification_time[notification_type] < yolo_notification_cooldown:
-                return
-        last_yolo_notification_time[notification_type] = current_time
+        # For YOLO objects, use combined cooldown to prevent overlap
+        if current_time - last_yolo_notification_time < yolo_notification_cooldown:
+            with notification_lock:
+                notification_in_progress = False
+            return
+        last_yolo_notification_time = current_time
     
     # URL encode the message
     encoded_msg = urllib.parse.quote(message)
@@ -406,20 +424,28 @@ def check_yolo_hazards(results, depth_frame, frame_rgb):
         if not is_hazard:
             continue
         
-        # Calculate center of bounding box in RGB coordinates
-        center_x_rgb = (x1 + x2) / 2
-        center_y_rgb = (y1 + y2) / 2
+        # Calculate sampling point - use bottom center for people (feet level), center for objects
+        if hazard_type == 'person':
+            # For people, sample at bottom of bounding box (feet level) for accurate ground distance
+            sample_x_rgb = (x1 + x2) / 2
+            sample_y_rgb = y2 - 20  # Bottom of box, slightly up to avoid edge
+        else:
+            # For furniture, use center
+            sample_x_rgb = (x1 + x2) / 2
+            sample_y_rgb = (y1 + y2) / 2
         
         # Convert to depth frame coordinates
-        center_x_depth = int(center_x_rgb * scale_x)
-        center_y_depth = int(center_y_rgb * scale_y)
+        sample_x_depth = int(sample_x_rgb * scale_x)
+        sample_y_depth = int(sample_y_rgb * scale_y)
         
-        # Sample depth in a larger region around center for better accuracy
-        sample_size = 20
-        x_start = max(0, center_x_depth - sample_size)
-        x_end = min(depth_w, center_x_depth + sample_size)
-        y_start = max(0, center_y_depth - sample_size)
-        y_end = min(depth_h, center_y_depth + sample_size)
+        # Sample depth in a region around the sampling point
+        # Use larger horizontal sampling for better accuracy
+        sample_size_x = 30
+        sample_size_y = 15
+        x_start = max(0, sample_x_depth - sample_size_x)
+        x_end = min(depth_w, sample_x_depth + sample_size_x)
+        y_start = max(0, sample_y_depth - sample_size_y)
+        y_end = min(depth_h, sample_y_depth + sample_size_y)
         
         depth_region = depth_frame[y_start:y_end, x_start:x_end]
         valid_depths = depth_region[(depth_region > 200) & (depth_region < 5000)]
@@ -427,36 +453,63 @@ def check_yolo_hazards(results, depth_frame, frame_rgb):
         if len(valid_depths) == 0:
             continue
         
-        # Use median depth to avoid outliers
-        distance_mm = np.median(valid_depths)
+        # Use median depth to avoid outliers, but prefer closer values for accuracy
+        # Sort and take median of closest half for better accuracy
+        sorted_depths = np.sort(valid_depths)
+        # Use median of closest 60% of readings for more accurate distance
+        closest_median_idx = int(len(sorted_depths) * 0.3)
+        distance_mm = np.median(sorted_depths[:closest_median_idx + len(sorted_depths) // 2])
         distance_m = distance_mm / 1000.0
         
         # STRICT: Only notify if object is close (within MAX_HAZARD_DISTANCE_M)
         if distance_m > MAX_HAZARD_DISTANCE_M:
             continue
         
-        # Build notification message
-        if hazard_type == 'person':
-            message = f"person ahead {distance_m:.1f}m"
-        elif hazard_type == 'chair':
-            message = f"chair ahead {distance_m:.1f}m"
-        elif hazard_type == 'desk':
-            message = f"desk ahead {distance_m:.1f}m"
-        else:
-            continue
-        
-        # Store hazard for sorting
+        # Store hazard info
         hazards.append({
             'distance': distance_m,
-            'message': message,
             'hazard_type': hazard_type
         })
     
-    # Sort by distance (closest first) and only send notification for the closest one
+    # Combine multiple hazards into one message
     if hazards:
+        # Sort by distance (closest first)
         hazards.sort(key=lambda x: x['distance'])
-        closest_hazard = hazards[0]
-        send_notification(closest_hazard['message'], closest_hazard['hazard_type'])
+        
+        # Group hazards by type (count duplicates)
+        hazard_counts = {}
+        for hazard in hazards:
+            h_type = hazard['hazard_type']
+            if h_type not in hazard_counts:
+                hazard_counts[h_type] = []
+            hazard_counts[h_type].append(hazard['distance'])
+        
+        # Build combined message
+        hazard_names = []
+        for h_type in ['person', 'chair', 'desk']:  # Order: person first, then furniture
+            if h_type in hazard_counts:
+                hazard_names.append(h_type)
+        
+        if len(hazard_names) == 0:
+            return
+        
+        # Build message
+        if len(hazard_names) == 1:
+            # Single item: include distance
+            h_type = hazard_names[0]
+            distance = hazards[0]['distance']  # Use closest distance
+            message = f"{h_type} ahead {distance:.1f}m"
+        else:
+            # Multiple items: combine names, no distance
+            if len(hazard_names) == 2:
+                message = f"{hazard_names[0]} and {hazard_names[1]} ahead"
+            else:
+                # 3+ items: use commas and "and"
+                items = ", ".join(hazard_names[:-1])
+                message = f"{items}, and {hazard_names[-1]} ahead"
+        
+        # Send combined notification
+        send_notification(message, 'yolo_hazard')
 
 with dai.Device(pipeline) as device:
     q_rgb = device.getOutputQueue("rgb", maxSize=4, blocking=False)
@@ -478,8 +531,9 @@ with dai.Device(pipeline) as device:
             continue
         frame_depth = depth_frame.getFrame()
         
-        # Run YOLO object detection on RGB frame with confidence threshold >= 65%
-        results = model(frame_rgb, verbose=False, conf=0.65)
+        # Run YOLO object detection (optimized for speed)
+        # Use smaller input size for faster inference
+        results = model(frame_rgb, verbose=False, conf=0.65, imgsz=640)
         
         # Check for close hazards (people, chairs, desks) - STRICT distance filtering
         check_yolo_hazards(results, frame_depth, frame_rgb)
@@ -487,7 +541,7 @@ with dai.Device(pipeline) as device:
         # Draw YOLO detections on the frame (already filtered by confidence)
         annotated_frame = results[0].plot()
         
-        # Detect stairs using depth data
+        # Detect stairs using depth data (always process for responsiveness)
         raw_stair_result = detect_stairs(frame_depth, frame_rgb)
         
         # Update tracker with new detection (provides temporal smoothing)
