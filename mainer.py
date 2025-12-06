@@ -381,18 +381,31 @@ def send_stair_notification(distance_m=None):
 
 def check_proximity_danger(depth_frame):
     """Check if any depth reading is < 20cm (about to hit something like a wall)."""
-    # Focus on lower portion of frame where obstacles would be
     h, w = depth_frame.shape
-    roi_bottom = int(h * 0.7)  # Check bottom 70% of frame
-    depth_roi = depth_frame[roi_bottom:, :]
     
-    # Check for any valid depth readings < 20cm (200mm)
-    close_obstacles = depth_roi[(depth_roi > 50) & (depth_roi < 200)]
+    # Filter out invalid readings (0, too small, or too large)
+    # Valid depth range: 50mm to 5000mm (5cm to 5m)
+    valid_mask = (depth_frame > 50) & (depth_frame < 5000)
+    valid_depths = depth_frame[valid_mask]
     
-    # If significant number of pixels are very close, send danger warning
-    if len(close_obstacles) > 100:  # At least 100 pixels indicating close obstacle
+    if len(valid_depths) == 0:
+        return False
+    
+    # Check minimum depth - if closest point is < 20cm, danger!
+    min_depth = np.min(valid_depths)
+    if min_depth < 200:  # Less than 20cm (200mm)
         send_notification("DANGER OBJECT AHEAD", 'proximity_danger')
         return True
+    
+    # Also check if we have many pixels indicating close obstacle
+    # Look for valid depth readings between 50mm and 200mm (5cm to 20cm)
+    close_obstacles = valid_depths[valid_depths < 200]
+    
+    # If we have significant number of close pixels, warn
+    if len(close_obstacles) > 30:  # At least 30 pixels indicating close obstacle
+        send_notification("DANGER OBJECT AHEAD", 'proximity_danger')
+        return True
+    
     return False
 
 def check_yolo_hazards(results, depth_frame, frame_rgb):
@@ -555,6 +568,7 @@ with dai.Device(pipeline) as device:
         frame_depth = depth_frame.getFrame()
         
         # Check for proximity danger first (depth < 20cm - about to hit something)
+        # This checks the entire depth frame for any readings < 20cm
         danger_detected = check_proximity_danger(frame_depth)
         
         # Run YOLO object detection (optimized for speed)
