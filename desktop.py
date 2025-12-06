@@ -43,7 +43,7 @@ class MainWindow(QMainWindow):
 
     def start_server(self, port):
         Handler.bridge = self.bridge
-        server = HTTPServer(("0.0.0.0", port), Handler)
+        server = HTTPServer(("127.0.0.1", port), Handler)
         server.serve_forever()
 
 app = QApplication(sys.argv)
