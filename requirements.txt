@@ -1,0 +1,5 @@
+depthai>=3.0.0
+depthai-sdk
+opencv-python>=4.5.0
+numpy
+
