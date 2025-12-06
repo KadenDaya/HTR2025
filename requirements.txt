@@ -5,3 +5,4 @@ numpy
 PySide6
 playsound3
 text-to-speech
+ultralytics
