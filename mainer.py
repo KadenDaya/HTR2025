@@ -7,6 +7,7 @@ from collections import deque
 import urllib.request
 import urllib.parse
 import time
+import threading
 
 class StairDetectionTracker:
     """Tracks stair detections across frames for temporal smoothing."""
@@ -310,8 +311,17 @@ HAZARD_CLASSES = {
     'desk': None,  # May not be in COCO, will check for table-like objects
 }
 
+def _send_http_request(url, message):
+    """Helper function to send HTTP request in background thread."""
+    try:
+        urllib.request.urlopen(url, timeout=0.5)
+        print(f"Sent notification: {message}")
+    except Exception as e:
+        # Silently fail if server is not available
+        pass
+
 def send_notification(message, notification_type='stair'):
-    """Send HTTP notification to localhost:8080/?msg= with throttling."""
+    """Send HTTP notification to localhost:8080/?msg= with throttling. Non-blocking."""
     global last_notification_time, last_yolo_notification_time
     
     current_time = time.time()
@@ -328,17 +338,13 @@ def send_notification(message, notification_type='stair'):
                 return
         last_yolo_notification_time[notification_type] = current_time
     
-    try:
-        # URL encode the message
-        encoded_msg = urllib.parse.quote(message)
-        url = f"http://localhost:8080/?msg={encoded_msg}"
-        
-        # Send GET request (non-blocking, timeout after 1 second)
-        urllib.request.urlopen(url, timeout=1.0)
-        print(f"Sent notification: {message}")
-    except Exception as e:
-        # Silently fail if server is not available
-        pass
+    # URL encode the message
+    encoded_msg = urllib.parse.quote(message)
+    url = f"http://localhost:8080/?msg={encoded_msg}"
+    
+    # Send GET request in background thread (truly non-blocking)
+    thread = threading.Thread(target=_send_http_request, args=(url, message), daemon=True)
+    thread.start()
 
 def send_stair_notification(distance_m=None):
     """Send HTTP notification for stairs."""
@@ -349,18 +355,26 @@ def send_stair_notification(distance_m=None):
     send_notification(message, 'stair')
 
 def check_yolo_hazards(results, depth_frame, frame_rgb):
-    """Check YOLO detections for close hazards and send notifications."""
+    """Check YOLO detections for close hazards and send notifications. Prioritizes closest objects."""
     if results[0].boxes is None or len(results[0].boxes) == 0:
         return
     
     boxes = results[0].boxes
-    h, w = depth_frame.shape
+    depth_h, depth_w = depth_frame.shape
+    rgb_h, rgb_w = frame_rgb.shape[:2]
+    
+    # Calculate scale factors to map RGB coordinates to depth coordinates
+    scale_x = depth_w / rgb_w
+    scale_y = depth_h / rgb_h
     
     # Get class names from model
     class_names = results[0].names
     
+    # Collect all hazards with their distances
+    hazards = []
+    
     for i, box in enumerate(boxes):
-        # Get bounding box coordinates
+        # Get bounding box coordinates (in RGB frame)
         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
         x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
         
@@ -392,16 +406,20 @@ def check_yolo_hazards(results, depth_frame, frame_rgb):
         if not is_hazard:
             continue
         
-        # Calculate distance to object using depth data
-        # Use center of bounding box
-        center_x = int((x1 + x2) / 2)
-        center_y = int((y1 + y2) / 2)
+        # Calculate center of bounding box in RGB coordinates
+        center_x_rgb = (x1 + x2) / 2
+        center_y_rgb = (y1 + y2) / 2
         
-        # Sample depth in a small region around center
-        x_start = max(0, center_x - 10)
-        x_end = min(w, center_x + 10)
-        y_start = max(0, center_y - 10)
-        y_end = min(h, center_y + 10)
+        # Convert to depth frame coordinates
+        center_x_depth = int(center_x_rgb * scale_x)
+        center_y_depth = int(center_y_rgb * scale_y)
+        
+        # Sample depth in a larger region around center for better accuracy
+        sample_size = 20
+        x_start = max(0, center_x_depth - sample_size)
+        x_end = min(depth_w, center_x_depth + sample_size)
+        y_start = max(0, center_y_depth - sample_size)
+        y_end = min(depth_h, center_y_depth + sample_size)
         
         depth_region = depth_frame[y_start:y_end, x_start:x_end]
         valid_depths = depth_region[(depth_region > 200) & (depth_region < 5000)]
@@ -427,8 +445,18 @@ def check_yolo_hazards(results, depth_frame, frame_rgb):
         else:
             continue
         
-        # Send notification
-        send_notification(message, hazard_type)
+        # Store hazard for sorting
+        hazards.append({
+            'distance': distance_m,
+            'message': message,
+            'hazard_type': hazard_type
+        })
+    
+    # Sort by distance (closest first) and only send notification for the closest one
+    if hazards:
+        hazards.sort(key=lambda x: x['distance'])
+        closest_hazard = hazards[0]
+        send_notification(closest_hazard['message'], closest_hazard['hazard_type'])
 
 with dai.Device(pipeline) as device:
     q_rgb = device.getOutputQueue("rgb", maxSize=4, blocking=False)
@@ -438,16 +466,20 @@ with dai.Device(pipeline) as device:
     print("Depth colors: Red/Yellow = CLOSE, Purple/Blue = FAR")
     
     while True:
-        # Get RGB frame
+        # Get RGB frame (non-blocking - queue was created with blocking=False)
         img_frame = q_rgb.get()
+        if img_frame is None:
+            continue
         frame_rgb = img_frame.getCvFrame()
         
-        # Get depth frame
+        # Get depth frame (non-blocking - queue was created with blocking=False)
         depth_frame = q_depth.get()
+        if depth_frame is None:
+            continue
         frame_depth = depth_frame.getFrame()
         
-        # Run YOLO object detection on RGB frame with confidence threshold >= 55%
-        results = model(frame_rgb, verbose=False, conf=0.55)
+        # Run YOLO object detection on RGB frame with confidence threshold >= 65%
+        results = model(frame_rgb, verbose=False, conf=0.65)
         
         # Check for close hazards (people, chairs, desks) - STRICT distance filtering
         check_yolo_hazards(results, frame_depth, frame_rgb)
