@@ -354,15 +354,16 @@ with dai.Device(pipeline) as device:
         
         # Draw stair detection on RGB frame
         if stair_result['detected']:
-            # Send HTTP notification
-            distance_m = None
-            if stair_result['distance_to_first_step']:
-                distance_m = stair_result['distance_to_first_step'] / 1000.0
-            send_stair_notification(
-                stair_result['num_steps'], 
-                distance=distance_m,
-                confidence=stair_result['confidence']
-            )
+            # Send HTTP notification only if confidence is above 75%
+            if stair_result['confidence'] >= 0.75:
+                distance_m = None
+                if stair_result['distance_to_first_step']:
+                    distance_m = stair_result['distance_to_first_step'] / 1000.0
+                send_stair_notification(
+                    stair_result['num_steps'], 
+                    distance=distance_m,
+                    confidence=stair_result['confidence']
+                )
             
             # Draw bounding box
             if stair_result['bbox']:
