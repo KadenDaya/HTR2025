@@ -10,10 +10,9 @@ import time
 
 class StairDetectionTracker:
     """Tracks stair detections across frames for temporal smoothing."""
-    def __init__(self, history_size=5, detection_threshold=0.5, min_confidence=0.4):
+    def __init__(self, history_size=5, detection_threshold=0.3):
         self.history = deque(maxlen=history_size)
         self.detection_threshold = detection_threshold
-        self.min_confidence = min_confidence
         self.current_state = {'detected': False, 'confidence': 0.0, 'num_steps': 0, 
                              'bbox': None, 'step_heights': [], 'distance_to_first_step': None,
                              'step_positions': []}
@@ -34,10 +33,10 @@ class StairDetectionTracker:
         detection_count = sum(1 for d in self.history if d['detected'])
         detection_ratio = detection_count / len(self.history)
         
-        # Smooth the detection state - require higher threshold and minimum confidence
-        if detection_ratio >= self.detection_threshold and avg_confidence >= self.min_confidence:
+        # Smooth the detection state
+        if detection_ratio >= self.detection_threshold:
             # Use most recent detection with high confidence, or average of recent ones
-            recent_detections = [d for d in self.history if d['detected'] and d['confidence'] >= self.min_confidence]
+            recent_detections = [d for d in self.history if d['detected']]
             if recent_detections:
                 # Use the most confident recent detection
                 best_detection = max(recent_detections, key=lambda x: x['confidence'])
@@ -46,15 +45,15 @@ class StairDetectionTracker:
             else:
                 self.current_state = new_detection
         else:
-            # Not enough detections to confirm or confidence too low
+            # Not enough detections to confirm
             self.current_state = {'detected': False, 'confidence': 0.0, 'num_steps': 0, 
                                  'bbox': None, 'step_heights': [], 'distance_to_first_step': None,
                                  'step_positions': []}
         
         return self.current_state
 
-def detect_stairs(depth_frame, rgb_frame=None, min_step_height_mm=100, max_step_height_mm=300, 
-                  min_steps=3, roi_bottom_percent=0.65):
+def detect_stairs(depth_frame, rgb_frame=None, min_step_height_mm=80, max_step_height_mm=350, 
+                  min_steps=2, roi_bottom_percent=0.65):
     """
     Detect stairs in depth frame using depth discontinuity analysis.
     
@@ -121,17 +120,17 @@ def detect_stairs(depth_frame, rgb_frame=None, min_step_height_mm=100, max_step_
     # Look for gradients that indicate depth increase (step going up)
     edge_strength = np.abs(gradient_y)
     
-    # Use stricter percentile threshold to reduce false positives
+    # Use lower percentile threshold to be more permissive
     if np.sum(valid_mask) > 0:
-        edge_threshold = np.nanpercentile(edge_strength[valid_mask], 70)  # Top 30% of gradients (stricter)
+        edge_threshold = np.nanpercentile(edge_strength[valid_mask], 60)  # Top 40% of gradients (more permissive)
     else:
         return {'detected': False, 'confidence': 0.0, 'num_steps': 0, 'bbox': None,
                 'step_heights': [], 'distance_to_first_step': None, 'step_positions': []}
     
-    # Create binary mask of potential step edges (stricter)
+    # Create binary mask of potential step edges (more permissive)
     edge_mask = (edge_strength > edge_threshold) & (gradient_y > 0) & valid_mask
     
-    if np.sum(edge_mask) < 50:  # Require more edge pixels to reduce false positives
+    if np.sum(edge_mask) < 30:  # Lower threshold: need minimum edge pixels
         return {'detected': False, 'confidence': 0.0, 'num_steps': 0, 'bbox': None,
                 'step_heights': [], 'distance_to_first_step': None, 'step_positions': []}
     
@@ -142,9 +141,9 @@ def detect_stairs(depth_frame, rgb_frame=None, min_step_height_mm=100, max_step_
     
     # Find horizontal lines (step edges) using Hough transform on edge mask
     edge_uint8 = edge_mask * 255
-    # Stricter Hough parameters to reduce false positives
-    lines = cv2.HoughLinesP(edge_uint8, 1, np.pi/180, threshold=30, 
-                            minLineLength=w//4, maxLineGap=20)
+    # More permissive Hough parameters
+    lines = cv2.HoughLinesP(edge_uint8, 1, np.pi/180, threshold=20, 
+                            minLineLength=w//5, maxLineGap=30)
     
     if lines is None or len(lines) < min_steps:
         return {'detected': False, 'confidence': 0.0, 'num_steps': 0, 'bbox': None,
@@ -154,8 +153,7 @@ def detect_stairs(depth_frame, rgb_frame=None, min_step_height_mm=100, max_step_
     step_y_positions = []
     for line in lines:
         x1, y1, x2, y2 = line[0]
-        # Stricter: require lines to be more horizontal (within 8 pixels)
-        if abs(y2 - y1) < 8:
+        if abs(y2 - y1) < 15:  # More permissive: horizontal line (within 15 pixels)
             y_avg = (y1 + y2) // 2
             step_y_positions.append(y_avg + roi_top)  # Adjust for ROI offset
     
@@ -196,8 +194,8 @@ def detect_stairs(depth_frame, rgb_frame=None, min_step_height_mm=100, max_step_
         # Calculate step height (depth difference)
         step_height = depth_top - depth_bottom
         
-        # Stricter validation - require steps to be within reasonable range
-        if min_step_height_mm <= step_height <= max_step_height_mm:
+        # More permissive validation - allow slightly out of range if pattern is consistent
+        if step_height >= min_step_height_mm * 0.7 and step_height <= max_step_height_mm * 1.3:
             step_heights.append(step_height)
             valid_steps.append((y_bottom, y_top))
     
@@ -205,42 +203,16 @@ def detect_stairs(depth_frame, rgb_frame=None, min_step_height_mm=100, max_step_
         return {'detected': False, 'confidence': 0.0, 'num_steps': 0, 'bbox': None,
                 'step_heights': [], 'distance_to_first_step': None, 'step_positions': []}
     
-    # Additional validation: check step spacing consistency
-    if len(valid_steps) > 1:
-        step_spacings = []
-        for i in range(len(valid_steps) - 1):
-            spacing = abs(valid_steps[i][0] - valid_steps[i+1][0])  # Pixel spacing
-            step_spacings.append(spacing)
-        
-        # Steps should be reasonably spaced (not too close, not too far)
-        avg_spacing = np.mean(step_spacings)
-        spacing_std = np.std(step_spacings)
-        
-        # Reject if spacing is too inconsistent (indicates false detection)
-        if spacing_std > avg_spacing * 0.5:  # More than 50% variation in spacing
-            return {'detected': False, 'confidence': 0.0, 'num_steps': 0, 'bbox': None,
-                    'step_heights': [], 'distance_to_first_step': None, 'step_positions': []}
-    
     # Calculate confidence based on number of steps and consistency
     num_steps = len(valid_steps)
     if len(step_heights) > 1:
         step_height_std = np.std(step_heights)
         step_height_mean = np.mean(step_heights)
-        # Require better consistency - reject if std is more than 30% of mean
-        if step_height_std > step_height_mean * 0.3:
-            return {'detected': False, 'confidence': 0.0, 'num_steps': 0, 'bbox': None,
-                    'step_heights': [], 'distance_to_first_step': None, 'step_positions': []}
         consistency = 1.0 - min(1.0, step_height_std / step_height_mean)  # Lower std = higher consistency
     else:
-        consistency = 0.3  # Lower consistency for single step
+        consistency = 0.5
     
-    # Require minimum confidence threshold
-    confidence = min(1.0, (num_steps / 5.0) * 0.6 + consistency * 0.4)  # Weight consistency more
-    
-    # Reject if confidence is too low
-    if confidence < 0.35:
-        return {'detected': False, 'confidence': 0.0, 'num_steps': 0, 'bbox': None,
-                'step_heights': [], 'distance_to_first_step': None, 'step_positions': []}
+    confidence = min(1.0, (num_steps / 5.0) * 0.7 + consistency * 0.3)  # Scale confidence
     
     # Calculate bounding box
     if valid_steps:
@@ -314,15 +286,15 @@ stereo.depth.link(xout_depth.input)
 model = YOLO('yolo11n.pt')  # Will download automatically if not found locally
 print("Loaded YOLO 11 model: yolo11n.pt")
 
-# Initialize stair detection tracker for temporal smoothing (stricter to reduce false positives)
-stair_tracker = StairDetectionTracker(history_size=5, detection_threshold=0.5, min_confidence=0.4)
+# Initialize stair detection tracker for temporal smoothing
+stair_tracker = StairDetectionTracker(history_size=5, detection_threshold=0.3)
 
 # Track last notification time to throttle HTTP requests
 last_notification_time = 0
 notification_cooldown = 2.0  # Seconds between notifications
 
 def send_stair_notification(num_steps, distance=None, confidence=None):
-    """Send HTTP notification to localhost:8080 when stairs are detected."""
+    """Send HTTP notification to localhost:8080/?msg= when stairs are detected."""
     global last_notification_time
     current_time = time.time()
     
