@@ -1,5 +1,5 @@
-from PySide6.QtWidgets import QApplication, QMainWindow, QDockWidget, QTextEdit, QWidget
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtWidgets import QApplication, QMainWindow, QTextEdit
+from PySide6.QtCore import QThread, Signal
 import sys, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import urllib.parse
@@ -27,13 +27,11 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Metal Chair 1.0")
-        self.setCentralWidget(QWidget())
+
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
-        dock = QDockWidget("Log", self)
-        dock.setAllowedAreas(Qt.BottomDockWidgetArea)
-        dock.setWidget(self.log_view)
-        self.addDockWidget(Qt.BottomDockWidgetArea, dock)
+        self.setCentralWidget(self.log_view)
+
         self.bridge = LogBridge()
         self.bridge.message.connect(self.log)
         threading.Thread(target=self.start_server, args=(8080,), daemon=True).start()
