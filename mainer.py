@@ -293,33 +293,142 @@ stair_tracker = StairDetectionTracker(history_size=5, detection_threshold=0.3)
 last_notification_time = 0
 notification_cooldown = 5.0  # Seconds between notifications (increased to prevent spamming while walking up stairs)
 
-def send_stair_notification(distance_m=None):
-    """Send HTTP notification to localhost:8080/?msg= when stairs are detected."""
-    global last_notification_time
+# Track last notification time per object type for YOLO hazards
+last_yolo_notification_time = {}
+yolo_notification_cooldown = 3.0  # Seconds between notifications for same object type
+
+# Maximum distance for YOLO hazard notifications (in meters) - STRICT threshold
+MAX_HAZARD_DISTANCE_M = 3.0  # Only notify for objects within 3 meters
+
+# YOLO class names for hazards we care about
+HAZARD_CLASSES = {
+    'person': 0,
+    'chair': 56,
+    'couch': 57,
+    'bed': 59,
+    'dining table': 60,
+    'desk': None,  # May not be in COCO, will check for table-like objects
+}
+
+def send_notification(message, notification_type='stair'):
+    """Send HTTP notification to localhost:8080/?msg= with throttling."""
+    global last_notification_time, last_yolo_notification_time
+    
     current_time = time.time()
     
-    # Throttle notifications (don't spam)
-    if current_time - last_notification_time < notification_cooldown:
-        return
+    # Use different cooldown based on notification type
+    if notification_type == 'stair':
+        if current_time - last_notification_time < notification_cooldown:
+            return
+        last_notification_time = current_time
+    else:
+        # For YOLO objects, track per object type
+        if notification_type in last_yolo_notification_time:
+            if current_time - last_yolo_notification_time[notification_type] < yolo_notification_cooldown:
+                return
+        last_yolo_notification_time[notification_type] = current_time
     
     try:
-        # Build message with distance to start of stairs
-        if distance_m is not None:
-            message = f"stairs ahead {distance_m:.1f}m"
-        else:
-            message = "stairs ahead"
-        
         # URL encode the message
         encoded_msg = urllib.parse.quote(message)
         url = f"http://localhost:8080/?msg={encoded_msg}"
         
         # Send GET request (non-blocking, timeout after 1 second)
         urllib.request.urlopen(url, timeout=1.0)
-        last_notification_time = current_time
         print(f"Sent notification: {message}")
     except Exception as e:
         # Silently fail if server is not available
         pass
+
+def send_stair_notification(distance_m=None):
+    """Send HTTP notification for stairs."""
+    if distance_m is not None:
+        message = f"stairs ahead {distance_m:.1f}m"
+    else:
+        message = "stairs ahead"
+    send_notification(message, 'stair')
+
+def check_yolo_hazards(results, depth_frame, frame_rgb):
+    """Check YOLO detections for close hazards and send notifications."""
+    if results[0].boxes is None or len(results[0].boxes) == 0:
+        return
+    
+    boxes = results[0].boxes
+    h, w = depth_frame.shape
+    
+    # Get class names from model
+    class_names = results[0].names
+    
+    for i, box in enumerate(boxes):
+        # Get bounding box coordinates
+        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+        
+        # Get class ID and confidence
+        cls_id = int(box.cls[0].cpu().numpy())
+        conf = float(box.conf[0].cpu().numpy())
+        class_name = class_names[cls_id].lower()
+        
+        # Only check for specific hazard classes
+        is_hazard = False
+        hazard_type = None
+        
+        if 'person' in class_name or cls_id == 0:
+            is_hazard = True
+            hazard_type = 'person'
+        elif 'chair' in class_name or cls_id == 56:
+            is_hazard = True
+            hazard_type = 'chair'
+        elif 'couch' in class_name or 'sofa' in class_name or cls_id == 57:
+            is_hazard = True
+            hazard_type = 'chair'  # Group furniture together
+        elif 'table' in class_name or 'desk' in class_name or cls_id == 60:
+            is_hazard = True
+            hazard_type = 'desk'
+        elif 'bed' in class_name or cls_id == 59:
+            is_hazard = True
+            hazard_type = 'chair'  # Group furniture together
+        
+        if not is_hazard:
+            continue
+        
+        # Calculate distance to object using depth data
+        # Use center of bounding box
+        center_x = int((x1 + x2) / 2)
+        center_y = int((y1 + y2) / 2)
+        
+        # Sample depth in a small region around center
+        x_start = max(0, center_x - 10)
+        x_end = min(w, center_x + 10)
+        y_start = max(0, center_y - 10)
+        y_end = min(h, center_y + 10)
+        
+        depth_region = depth_frame[y_start:y_end, x_start:x_end]
+        valid_depths = depth_region[(depth_region > 200) & (depth_region < 5000)]
+        
+        if len(valid_depths) == 0:
+            continue
+        
+        # Use median depth to avoid outliers
+        distance_mm = np.median(valid_depths)
+        distance_m = distance_mm / 1000.0
+        
+        # STRICT: Only notify if object is close (within MAX_HAZARD_DISTANCE_M)
+        if distance_m > MAX_HAZARD_DISTANCE_M:
+            continue
+        
+        # Build notification message
+        if hazard_type == 'person':
+            message = f"person ahead {distance_m:.1f}m"
+        elif hazard_type == 'chair':
+            message = f"chair ahead {distance_m:.1f}m"
+        elif hazard_type == 'desk':
+            message = f"desk ahead {distance_m:.1f}m"
+        else:
+            continue
+        
+        # Send notification
+        send_notification(message, hazard_type)
 
 with dai.Device(pipeline) as device:
     q_rgb = device.getOutputQueue("rgb", maxSize=4, blocking=False)
@@ -333,15 +442,18 @@ with dai.Device(pipeline) as device:
         img_frame = q_rgb.get()
         frame_rgb = img_frame.getCvFrame()
         
-        # Run YOLO object detection on RGB frame with confidence threshold >= 55%
-        results = model(frame_rgb, verbose=False, conf=0.55)
-        
-        # Draw YOLO detections on the frame (already filtered by confidence)
-        annotated_frame = results[0].plot()
-        
         # Get depth frame
         depth_frame = q_depth.get()
         frame_depth = depth_frame.getFrame()
+        
+        # Run YOLO object detection on RGB frame with confidence threshold >= 55%
+        results = model(frame_rgb, verbose=False, conf=0.55)
+        
+        # Check for close hazards (people, chairs, desks) - STRICT distance filtering
+        check_yolo_hazards(results, frame_depth, frame_rgb)
+        
+        # Draw YOLO detections on the frame (already filtered by confidence)
+        annotated_frame = results[0].plot()
         
         # Detect stairs using depth data
         raw_stair_result = detect_stairs(frame_depth, frame_rgb)
