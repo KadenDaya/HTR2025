@@ -1,10 +1,10 @@
-# CEEing – Computer Engineered Eyes
+# CEE – Computer Engineered Eyes
 
 > **"CEE the chair, CEE the world"** – The Metal Chairs
 
 ## Overview
 
-CEEing is a project designed to reduce the dangers faced by people with blindness while navigating their environment. Using computer vision, the system detects obstacles and provides real-time auditory guidance to help users move safely and confidently.
+CEE is a project designed to reduce the dangers faced by people with blindness while navigating their environment. Using computer vision, the system detects obstacles and provides real-time auditory guidance to help users move safely and confidently.
 
 ## Features
 
@@ -24,4 +24,4 @@ CEEing is a project designed to reduce the dangers faced by people with blindnes
 
 ## Purpose
 
-CEEing aims to enhance mobility, safety, and independence for individuals with visual impairments through accessible, intelligent, and real-time computer vision assistance.
+CEE aims to enhance mobility, safety, and independence for individuals with visual impairments through accessible, intelligent, and real-time computer vision assistance.
